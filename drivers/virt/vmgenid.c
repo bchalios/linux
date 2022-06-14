@@ -21,24 +21,20 @@ struct vmgenid_state {
 	u8 this_id[VMGENID_SIZE];
 };
 
-static int vmgenid_add(struct acpi_device *device)
+static int parse_vmgenid_address(struct acpi_device *device, acpi_string object_name,
+		phys_addr_t *phys_addr)
 {
 	struct acpi_buffer parsed = { ACPI_ALLOCATE_BUFFER };
-	struct vmgenid_state *state;
-	union acpi_object *obj;
-	phys_addr_t phys_addr;
 	acpi_status status;
+	union acpi_object *obj;
 	int ret = 0;
 
-	state = devm_kmalloc(&device->dev, sizeof(*state), GFP_KERNEL);
-	if (!state)
-		return -ENOMEM;
-
-	status = acpi_evaluate_object(device->handle, "ADDR", NULL, &parsed);
+	status = acpi_evaluate_object(device->handle, object_name, NULL, &parsed);
 	if (ACPI_FAILURE(status)) {
-		ACPI_EXCEPTION((AE_INFO, status, "Evaluating ADDR"));
+		ACPI_EXCEPTION((AE_INFO, status, "Evaluating vmgenid object"));
 		return -ENODEV;
 	}
+
 	obj = parsed.pointer;
 	if (!obj || obj->type != ACPI_TYPE_PACKAGE || obj->package.count != 2 ||
 	    obj->package.elements[0].type != ACPI_TYPE_INTEGER ||
@@ -47,22 +43,38 @@ static int vmgenid_add(struct acpi_device *device)
 		goto out;
 	}
 
-	phys_addr = (obj->package.elements[0].integer.value << 0) |
-		    (obj->package.elements[1].integer.value << 32);
+	*phys_addr = (obj->package.elements[0].integer.value << 0) |
+		     (obj->package.elements[1].integer.value << 32);
+
+out:
+	ACPI_FREE(parsed.pointer);
+	return ret;
+}
+
+static int vmgenid_add(struct acpi_device *device)
+{
+	struct vmgenid_state *state;
+	phys_addr_t phys_addr;
+	int ret;
+
+	state = devm_kmalloc(&device->dev, sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return -ENOMEM;
+
+	ret = parse_vmgenid_address(device, "ADDR", &phys_addr);
+	if (ret)
+		return ret;
+
 	state->next_id = devm_memremap(&device->dev, phys_addr, VMGENID_SIZE, MEMREMAP_WB);
-	if (IS_ERR(state->next_id)) {
-		ret = PTR_ERR(state->next_id);
-		goto out;
-	}
+	if (IS_ERR(state->next_id))
+		return PTR_ERR(state->next_id);
 
 	memcpy(state->this_id, state->next_id, sizeof(state->this_id));
 	add_device_randomness(state->this_id, sizeof(state->this_id));
 
 	device->driver_data = state;
 
-out:
-	ACPI_FREE(parsed.pointer);
-	return ret;
+	return 0;
 }
 
 static void vmgenid_notify(struct acpi_device *device, u32 event)
