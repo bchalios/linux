@@ -5,6 +5,9 @@
  */
 
 #include "asm-generic/errno.h"
+#include "linux/gfp.h"
+#include "linux/minmax.h"
+#include "linux/sysfs.h"
 #include <linux/err.h>
 #include <linux/hw_random.h>
 #include <linux/scatterlist.h>
@@ -17,6 +20,10 @@
 
 static DEFINE_IDA(rng_index_ida);
 
+#ifdef CONFIG_SYSFS
+static struct kobject *virtio_rng_kobj;
+#endif
+
 struct virtrng_info {
 	struct hwrng hwrng;
 	struct virtqueue *vq;
@@ -25,6 +32,12 @@ struct virtrng_info {
 	struct virtqueue *leakq[2];
 	spinlock_t lock;
 	int active_leakq;
+#ifdef CONFIG_SYSFS
+	struct kobject *kobj;
+	struct bin_attribute vm_gen_counter_attr;
+	unsigned long map_buffer;
+	unsigned long next_vm_gen_counter;
+#endif
 
 	char name[25];
 	int index;
@@ -43,6 +56,40 @@ struct virtrng_info {
 	u8 leak_data[SMP_CACHE_BYTES];
 #endif
 };
+
+#ifdef CONFIG_SYSFS
+ssize_t virtrng_sysfs_read(struct file *filep, struct kobject *kobj,
+		struct bin_attribute *attr, char *buf, loff_t pos, size_t len)
+{
+	struct virtrng_info *vi = attr->private;
+	unsigned long gen_counter = *(unsigned long *)vi->map_buffer;
+
+	if (!len)
+		return 0;
+
+	len = min(len, sizeof(gen_counter));
+	memcpy(buf, &gen_counter, len);
+
+	return len;
+}
+
+int virtrng_sysfs_mmap(struct file *filep, struct kobject *kobj,
+		struct bin_attribute *attr, struct vm_area_struct *vma)
+{
+	struct virtrng_info *vi = attr->private;
+
+	if (vma->vm_pgoff || vma_pages(vma) > 1)
+		return -EINVAL;
+
+	if (vma->vm_flags & VM_WRITE)
+		return -EPERM;
+
+	vma->vm_flags |= VM_DONTEXPAND;
+	vma->vm_flags &= ~VM_MAYWRITE;
+
+	return vm_insert_page(vma, vma->vm_start, virt_to_page(vi->map_buffer));
+}
+#endif
 
 /* Swaps the queues and returns the new active leak queue. */
 static struct virtqueue *swap_leakqs(struct virtrng_info *vi)
@@ -83,7 +130,7 @@ int virtrng_fill_on_leak(struct virtrng_info *vi, void *data, size_t len)
 
 	vq = get_active_leakq(vi);
 	ret = add_fill_on_leak_request(vi, vq, data, len);
-	if (ret)
+	if (!ret)
 		virtqueue_kick(vq);
 
 	spin_unlock_irqrestore(&vi->lock, flags);
@@ -123,7 +170,7 @@ int virtrng_copy_on_leak(struct virtrng_info *vi, void *to, void *from, size_t l
 
 	vq = get_active_leakq(vi);
 	ret = add_copy_on_leak_request(vi, vq, to, from, len);
-	if (ret)
+	if (!ret)
 		virtqueue_kick(vq);
 
 	spin_unlock_irqrestore(&vi->lock, flags);
@@ -139,6 +186,9 @@ static void entropy_leak_detected(struct virtqueue *vq)
 	unsigned long flags;
 	void *buffer;
 	bool kick_activeq = false;
+#ifdef CONFIG_SYSFS
+	bool notify_sysfs = false;
+#endif
 
 	spin_lock_irqsave(&vi->lock, flags);
 
@@ -160,12 +210,34 @@ static void entropy_leak_detected(struct virtqueue *vq)
 			add_fill_on_leak_request(vi, activeq, vi->leak_data, sizeof(vi->leak_data));
 			kick_activeq = true;
 		}
+
+#ifdef CONFIG_SYSFS
+		if (buffer == (void *)vi->map_buffer) {
+			notify_sysfs = true;
+
+			/* Add a request to bump the generation counter on the next leak event.
+			 * We have already swapped leak queues, so this will get properly handled
+			 * with the next entropy leak event.
+			 */
+			vi->next_vm_gen_counter++;
+			add_copy_on_leak_request(vi, activeq, (void *)vi->map_buffer,
+					&vi->next_vm_gen_counter, sizeof(unsigned long));
+
+			kick_activeq = true;
+		}
+#endif
 	}
 
 	if (kick_activeq)
 		virtqueue_kick(activeq);
 
 	spin_unlock_irqrestore(&vi->lock, flags);
+
+#ifdef CONFIG_SYSFS
+	/* Notify anyone polling on the sysfs file */
+	if (notify_sysfs)
+		sysfs_notify(vi->kobj, NULL, "vm_gen_counter");
+#endif
 }
 
 static void random_recv_done(struct virtqueue *vq)
@@ -302,6 +374,59 @@ err:
 	return ret;
 }
 
+#ifdef CONFIG_SYSFS
+static int setup_sysfs(struct virtrng_info *vi)
+{
+	int err;
+
+	vi->next_vm_gen_counter = 1;
+
+	/* We have one binary file per device under /sys/virtio-rng/<device>/vm_gen_counter */
+	vi->vm_gen_counter_attr.attr.name = "vm_gen_counter";
+	vi->vm_gen_counter_attr.attr.mode = 0444;
+	vi->vm_gen_counter_attr.read = virtrng_sysfs_read;
+	vi->vm_gen_counter_attr.mmap = virtrng_sysfs_mmap;
+	vi->vm_gen_counter_attr.private = vi;
+
+	vi->map_buffer = get_zeroed_page(GFP_KERNEL);
+	if (!vi->map_buffer)
+		return -ENOMEM;
+
+	err = -ENOMEM;
+	vi->kobj = kobject_create_and_add(vi->name, virtio_rng_kobj);
+	if (!vi->kobj)
+		goto err_page;
+
+	err = sysfs_create_bin_file(vi->kobj, &vi->vm_gen_counter_attr);
+	if (err)
+		goto err_kobj;
+
+	return 0;
+
+err_kobj:
+	kobject_put(vi->kobj);
+err_page:
+	free_pages(vi->map_buffer, 0);
+	return err;
+}
+
+static void cleanup_sysfs(struct virtrng_info *vi)
+{
+	sysfs_remove_bin_file(vi->kobj, &vi->vm_gen_counter_attr);
+	kobject_put(vi->kobj);
+	free_pages(vi->map_buffer, 0);
+}
+#else
+static int setup_sysfs(struct virtrng_info *vi)
+{
+	return 0;
+}
+
+static void cleanup_sysfs(struct virtrng_info *vi)
+{
+}
+#endif
+
 static int probe_common(struct virtio_device *vdev)
 {
 	int err, index;
@@ -332,11 +457,15 @@ static int probe_common(struct virtio_device *vdev)
 	if (vi->has_leakqs) {
 		spin_lock_init(&vi->lock);
 		vi->active_leakq = 0;
+
+		err = setup_sysfs(vi);
+		if (err)
+			goto err_find;
 	}
 
 	err = init_virtqueues(vi, vdev);
 	if (err)
-		goto err_find;
+		goto err_sysfs;
 
 	virtio_device_ready(vdev);
 
@@ -346,8 +475,18 @@ static int probe_common(struct virtio_device *vdev)
 	/* we always have a fill_on_leak request pending */
 	virtrng_fill_on_leak(vi, vi->leak_data, sizeof(vi->leak_data));
 
+#ifdef CONFIG_SYSFS
+	/* also a copy_on_leak request for the generation counter when we have sysfs
+	 * support.
+	 */
+	virtrng_copy_on_leak(vi, (void *)vi->map_buffer, &vi->next_vm_gen_counter,
+			sizeof(unsigned long));
+#endif
+
 	return 0;
 
+err_sysfs:
+	cleanup_sysfs(vi);
 err_find:
 	ida_simple_remove(&rng_index_ida, index);
 err_ida:
@@ -365,6 +504,8 @@ static void remove_common(struct virtio_device *vdev)
 	complete(&vi->have_data);
 	if (vi->hwrng_register_done)
 		hwrng_unregister(&vi->hwrng);
+	if (vi->has_leakqs)
+		cleanup_sysfs(vi);
 	virtio_reset_device(vdev);
 	vdev->config->del_vqs(vdev);
 	ida_simple_remove(&rng_index_ida, vi->index);
@@ -446,6 +587,25 @@ static struct virtio_driver virtio_rng_driver = {
 	.restore =	virtrng_restore,
 #endif
 };
+
+#ifdef CONFIG_SYSFS
+static int __init virtio_rng_init(void)
+{
+	virtio_rng_kobj = kobject_create_and_add("virtio-rng", NULL);
+	if (!virtio_rng_kobj)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void __exit virtio_rng_fini(void)
+{
+	kobject_put(virtio_rng_kobj);
+}
+
+module_init(virtio_rng_init);
+module_exit(virtio_rng_fini);
+#endif
 
 module_virtio_driver(virtio_rng_driver);
 MODULE_DEVICE_TABLE(virtio, id_table);
